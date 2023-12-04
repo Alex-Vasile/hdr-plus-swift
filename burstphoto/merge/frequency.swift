@@ -124,10 +124,8 @@ func align_merge_frequency_domain(progress: ProcessingProgress, ref_idx: Int, mo
         // convert reference texture into RGBA pixel format that SIMD instructions can be applied
         let ref_texture_rgba = convert_to_rgba(ref_texture, crop_merge_x, crop_merge_y)
         
-        var black_level_mean = Double(black_level[ref_idx].reduce(0, +)) / Double(black_level[ref_idx].count)
-        
         // build reference pyramid
-        let ref_pyramid = build_pyramid(ref_texture, downscale_factor_array, black_level_mean, color_factors[ref_idx])
+        let ref_pyramid = build_pyramid(ref_texture, downscale_factor_array, black_level[ref_idx], color_factors[ref_idx])
               
         // estimate noise level of tiles
         let rms_texture = calculate_rms_rgba(ref_texture_rgba, tile_info_merge)
@@ -151,11 +149,9 @@ func align_merge_frequency_domain(progress: ProcessingProgress, ref_idx: Int, mo
             // prepare comparison texture by correcting hot pixels, equalizing exposure and extending the texture
             let comp_texture = prepare_texture(textures[comp_idx], hotpixel_weight_texture, pad_left, pad_right, pad_top, pad_bottom, (exposure_bias[ref_idx]-exposure_bias[comp_idx]), black_level, comp_idx)
             
-            black_level_mean = Double(black_level[comp_idx].reduce(0, +)) / Double(black_level[comp_idx].count)
-            
             // align comparison texture
             let aligned_texture_rgba = convert_to_rgba(
-                align_texture(ref_pyramid, comp_texture, downscale_factor_array, tile_size_array, search_dist_array, (exposure_bias[comp_idx]==exposure_bias[ref_idx]), black_level_mean, color_factors[comp_idx]),
+                align_texture(ref_pyramid, comp_texture, downscale_factor_array, tile_size_array, search_dist_array, (exposure_bias[comp_idx]==exposure_bias[ref_idx]), black_level[comp_idx], color_factors[comp_idx]),
                 crop_merge_x,
                 crop_merge_y
             )
@@ -173,6 +169,9 @@ func align_merge_frequency_domain(progress: ProcessingProgress, ref_idx: Int, mo
             // add mismatch texture to the total, accumulated mismatch texture
             add_texture(mismatch_texture, total_mismatch_texture, textures.count)
          
+            // TODO: Get rid of
+            let black_level_mean = Double(black_level[comp_idx].reduce(0, +)) / Double(black_level[comp_idx].count)
+            
             let highlights_norm_texture = calculate_highlights_norm_rgba(aligned_texture_rgba, exposure_factor, tile_info_merge, (white_level == -1 ? 1000000 : white_level), black_level_mean)
             
             // transform aligned comparison texture into the frequency domain

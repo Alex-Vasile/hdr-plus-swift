@@ -11,7 +11,7 @@ let find_best_tile_alignment_state = try! device.makeComputePipelineState(functi
 let warp_texture_bayer_state = try! device.makeComputePipelineState(function: mfl.makeFunction(name: "warp_texture_bayer")!)
 let warp_texture_xtrans_state = try! device.makeComputePipelineState(function: mfl.makeFunction(name: "warp_texture_xtrans")!)
 
-func align_texture(_ ref_pyramid: [MTLTexture], _ comp_texture: MTLTexture, _ downscale_factor_array: Array<Int>, _ tile_size_array: Array<Int>, _ search_dist_array: Array<Int>, _ uniform_exposure: Bool, _ black_level_mean: Double, _ color_factors3: Array<Double>) -> MTLTexture {
+func align_texture(_ ref_pyramid: [MTLTexture], _ comp_texture: MTLTexture, _ downscale_factor_array: Array<Int>, _ tile_size_array: Array<Int>, _ search_dist_array: Array<Int>, _ uniform_exposure: Bool, _ black_levels: [Int], _ color_factors3: Array<Double>) -> MTLTexture {
         
     // initialize tile alignments
     let alignment_descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rg16Sint, width: 1, height: 1, mipmapped: false)
@@ -24,7 +24,7 @@ func align_texture(_ ref_pyramid: [MTLTexture], _ comp_texture: MTLTexture, _ do
     var tile_info = TileInfo(tile_size: 0, tile_size_merge: 0, search_dist: 0, n_tiles_x: 0, n_tiles_y: 0, n_pos_1d: 0, n_pos_2d: 0)
     
     // build comparison pyramid
-    let comp_pyramid = build_pyramid(comp_texture, downscale_factor_array, black_level_mean, color_factors3)
+    let comp_pyramid = build_pyramid(comp_texture, downscale_factor_array, black_levels, color_factors3)
     
     // align tiles
     for i in (0 ... downscale_factor_array.count-1).reversed() {
@@ -81,14 +81,43 @@ func align_texture(_ ref_pyramid: [MTLTexture], _ comp_texture: MTLTexture, _ do
 }
 
 
-func avg_pool(_ input_texture: MTLTexture, _ scale: Int, _ black_level_mean: Double, _ normalization: Bool, _ color_factors3: Array<Double>) -> MTLTexture {
-
+func avg_pool(_ input_texture: MTLTexture, _ scale: Int, _ black_levels: [Int], _ normalization: Bool, _ color_factors: Array<Double>) -> MTLTexture {
+    
     // always set pixel format to float16 with reduced bit depth to make alignment as fast as possible
     let output_texture_descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r16Float, width: input_texture.width/scale, height: input_texture.height/scale, mipmapped: false)
     output_texture_descriptor.usage = [.shaderRead, .shaderWrite]
     output_texture_descriptor.storageMode = .private
     let output_texture = device.makeTexture(descriptor: output_texture_descriptor)!
     output_texture.label = "\(input_texture.label!.components(separatedBy: ":")[0]): pool w/ scale \(scale)"
+    
+    let black_levels_buffer = device.makeBuffer(bytes: black_levels.map{Float32($0)},
+                                                length: MemoryLayout<Float32>.size * black_levels.count)!
+    
+    let mosaic_pattern_width = Int(sqrt(Double(black_levels.count)))
+    let color_factor_mean: Double
+    let color_factors_scaled: [Float32]
+    if (mosaic_pattern_width == 6) {
+        color_factor_mean = (8.0*color_factors[0] + 20.0*color_factors[1] + 8.0*color_factors[2]) / 36.0
+        color_factors_scaled = [
+            color_factors[1], color_factors[1], color_factors[2], color_factors[1], color_factors[1], color_factors[0], // GGBGGR
+            color_factors[2], color_factors[0], color_factors[1], color_factors[0], color_factors[2], color_factors[1], // BRGRBG
+            color_factors[1], color_factors[1], color_factors[2], color_factors[1], color_factors[1], color_factors[0], // GGBGGR
+            color_factors[1], color_factors[1], color_factors[0], color_factors[1], color_factors[1], color_factors[2], // GGRGGB
+            color_factors[0], color_factors[2], color_factors[1], color_factors[2], color_factors[0], color_factors[1], // RBGBRG
+            color_factors[1], color_factors[1], color_factors[0], color_factors[1], color_factors[1], color_factors[2]  // GGRGGB
+        ].map{ Float32(color_factor_mean / $0) }
+    } else if (mosaic_pattern_width == 2) {
+        color_factor_mean = (    color_factors[0] +  2.0*color_factors[1] +     color_factors[2]) /  4.0
+        color_factors_scaled = [
+            color_factors[0], color_factors[1],
+            color_factors[1], color_factors[2]
+        ].map{ Float32(color_factor_mean / $0) }
+    } else {
+        color_factor_mean = (    color_factors[0] +      color_factors[1] +     color_factors[2]) /  3.0
+        color_factors_scaled = [ color_factors[0], color_factors[1], color_factors[2]].map{ Float32(color_factor_mean / $0) }
+    }
+    let color_factors_scaled_buffer = device.makeBuffer(bytes: color_factors_scaled,
+                                                length: MemoryLayout<Float32>.size * color_factors_scaled.count)!
     
     let command_buffer = command_queue.makeCommandBuffer()!
     command_buffer.label = "Avg Pool"
@@ -99,13 +128,14 @@ func avg_pool(_ input_texture: MTLTexture, _ scale: Int, _ black_level_mean: Dou
     let threads_per_thread_group = get_threads_per_thread_group(state, threads_per_grid)
     command_encoder.setTexture(input_texture, index: 0)
     command_encoder.setTexture(output_texture, index: 1)
-    command_encoder.setBytes([Int32(scale)], length: MemoryLayout<Int32>.stride, index: 0)
-    command_encoder.setBytes([Float32(black_level_mean)], length: MemoryLayout<Float32>.stride, index: 1)
+    command_encoder.setBuffer(black_levels_buffer, offset: 0, index: 0)
+    command_encoder.setBytes([Int32(scale)], length: MemoryLayout<Int32>.stride, index: 1)
+    command_encoder.setBytes([Int32(mosaic_pattern_width)], length: MemoryLayout<Int32>.stride, index: 2)
+    
     
     if normalization {
-        command_encoder.setBytes([Float32(color_factors3[0])], length: MemoryLayout<Float32>.stride, index: 2)
-        command_encoder.setBytes([Float32(color_factors3[1])], length: MemoryLayout<Float32>.stride, index: 3)
-        command_encoder.setBytes([Float32(color_factors3[2])], length: MemoryLayout<Float32>.stride, index: 4)
+        command_encoder.setBytes([Float32(color_factor_mean)], length: MemoryLayout<Float32>.stride, index: 3)
+        command_encoder.setBuffer(color_factors_scaled_buffer, offset: 0, index: 4)
     }
     
     command_encoder.dispatchThreads(threads_per_grid, threadsPerThreadgroup: threads_per_thread_group)
@@ -116,16 +146,19 @@ func avg_pool(_ input_texture: MTLTexture, _ scale: Int, _ black_level_mean: Dou
 }
 
 
-func build_pyramid(_ input_texture: MTLTexture, _ downscale_factor_list: Array<Int>, _ black_level_mean: Double, _ color_factors3: Array<Double>) -> Array<MTLTexture> {
+func build_pyramid(_ input_texture: MTLTexture, _ downscale_factor_list: Array<Int>, _ black_levels: [Int], _ color_factors3: Array<Double>) -> Array<MTLTexture> {
+    
+    let black_levels_zero = Array(repeating: 0, count: black_levels.count)
     
     // iteratively resize the current layer in the pyramid
     var pyramid: Array<MTLTexture> = []
     for (i, downscale_factor) in downscale_factor_list.enumerated() {
         if i == 0 {
             // If color_factor is NOT available, a negative value will be set and normalization is deactivated.
-            pyramid.append(avg_pool(input_texture, downscale_factor, max(0.0, black_level_mean), (color_factors3[0] > 0), color_factors3))
+            pyramid.append(avg_pool(input_texture, downscale_factor, black_levels, (color_factors3[0] > 0), color_factors3))
         } else {
-            pyramid.append(avg_pool(blur(pyramid.last!, with_pattern_width: 1, using_kernel_size: 2), downscale_factor, 0.0, false, color_factors3))
+            pyramid.append(avg_pool(blur(pyramid.last!, with_pattern_width: 1, using_kernel_size: 2), 
+                                    downscale_factor, black_levels_zero, false, color_factors3))
         }
     }
     return pyramid

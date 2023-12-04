@@ -3,21 +3,26 @@
 using namespace metal;
 
 
-kernel void avg_pool(texture2d<float, access::read> in_texture [[texture(0)]],
+kernel void avg_pool(texture2d<float, access::read> in_texture   [[texture(0)]],
                      texture2d<float, access::write> out_texture [[texture(1)]],
-                     constant int& scale [[buffer(0)]],
-                     constant float& black_level [[buffer(1)]],
+                     constant float* black_levels       [[buffer(0)]],
+                     constant int& scale                [[buffer(1)]],
+                     constant int& mosaic_pattern_width [[buffer(2)]],
                      uint2 gid [[thread_position_in_grid]]) {
     
     float out_pixel = 0;
-    int x0 = gid.x * scale;
-    int y0 = gid.y * scale;
+    int const x0 = gid.x * scale;
+    int const y0 = gid.y * scale;
     
+    int x, y, ix, iy;
     for (int dx = 0; dx < scale; dx++) {
+        x = x0 + dx;
+        ix = x % mosaic_pattern_width;
         for (int dy = 0; dy < scale; dy++) {
-            int x = x0 + dx;
-            int y = y0 + dy;
-            out_pixel += (in_texture.read(uint2(x, y)).r - black_level);
+            iy = mosaic_pattern_width * (y % mosaic_pattern_width);
+            y = y0 + dy;
+            
+            out_pixel += in_texture.read(uint2(x, y)).r - black_levels[ix + iy];
         }
     }
     
@@ -26,27 +31,28 @@ kernel void avg_pool(texture2d<float, access::read> in_texture [[texture(0)]],
 }
 
 
-kernel void avg_pool_normalization(texture2d<float, access::read> in_texture [[texture(0)]],
-                                   texture2d<float, access::write> out_texture [[texture(1)]],
-                                   constant int& scale [[buffer(0)]],
-                                   constant float& black_level [[buffer(1)]],
-                                   constant float& factor_red [[buffer(2)]],
-                                   constant float& factor_green [[buffer(3)]],
-                                   constant float& factor_blue [[buffer(4)]],
+kernel void avg_pool_normalization(texture2d<float, access::read> in_texture    [[texture(0)]],
+                                   texture2d<float, access::write> out_texture  [[texture(1)]],
+                                   constant float* black_level          [[buffer(0)]],
+                                   constant int&   scale                [[buffer(1)]],
+                                   constant int&   mosaic_pattern_width [[buffer(2)]],
+                                   constant float& mean_factor          [[buffer(3)]],
+                                   constant float* color_factors_scaled [[buffer(4)]],
                                    uint2 gid [[thread_position_in_grid]]) {
     
     float out_pixel = 0;
-    int x0 = gid.x * scale;
-    int y0 = gid.y * scale;
+    int const x0 = gid.x * scale;
+    int const y0 = gid.y * scale;
     
-    float const norm_factors[4] = {factor_red, factor_green, factor_green, factor_blue};
-    float const mean_factor = 0.25f*(norm_factors[0]+norm_factors[1]+norm_factors[2]+norm_factors[3]);
-     
+    int x, y, ix, iy;
     for (int dx = 0; dx < scale; dx++) {
+        x = x0 + dx;
+        ix = x % mosaic_pattern_width;
         for (int dy = 0; dy < scale; dy++) {
-            int x = x0 + dx;
-            int y = y0 + dy;
-            out_pixel += (mean_factor/norm_factors[dy*scale+dx]*in_texture.read(uint2(x, y)).r - black_level);
+            y = y0 + dy;
+            iy = mosaic_pattern_width * (y % mosaic_pattern_width);
+            
+            out_pixel += in_texture.read(uint2(x, y)).r * color_factors_scaled[ix + iy] - black_level[ix + iy];
         }
     }
 
